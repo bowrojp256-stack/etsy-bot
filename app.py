@@ -3,9 +3,12 @@ import json
 import base64
 import requests
 import xml.etree.ElementTree as ET
+import time
+import struct
+import hashlib
 from flask import Flask, request, make_response
 from openai import OpenAI
-from WXBizMsgCrypt import WXBizMsgCrypt
+from Crypto.Cipher import AES
 
 app = Flask(__name__)
 
@@ -21,10 +24,76 @@ BITABLE_TABLE_ID = os.environ.get("BITABLE_TABLE_ID", "")
 WX_CORP_ID = os.environ.get("WX_CORP_ID", "")
 WX_TOKEN = os.environ.get("WX_TOKEN", "")
 WX_AES_KEY = os.environ.get("WX_AES_KEY", "")
-WX_CORP_SECRET = os.environ.get("WX_CORP_SECRET", "")  # 自建应用的 Secret
+WX_CORP_SECRET = os.environ.get("WX_CORP_SECRET", "")
 
+
+# ------------------------------------------------------------------
+# 企业微信加解密核心算法 (自包含，无需依赖外部 WXBizMsgCrypt 包)
+# ------------------------------------------------------------------
+class WXBizMsgCrypt:
+    def __init__(self, sToken, sEncodingAESKey, sReceiveId):
+        self.key = base64.b64decode(sEncodingAESKey + "=")
+        self.token = sToken
+        self.receiveId = sReceiveId
+
+    def VerifyURL(self, sMsgSignature, sTimeStamp, sNonce, sEchoStr):
+        sha1 = hashlib.sha1()
+        sortlist = [self.token, sTimeStamp, sNonce, sEchoStr]
+        sortlist.sort()
+        sha1.update("".join(sortlist).encode('utf-8'))
+        signature = sha1.hexdigest()
+
+        if signature != sMsgSignature:
+            return -40001, None
+
+        try:
+            cipher = AES.new(self.key, AES.MODE_CBC, self.key[:16])
+            decrypted = cipher.decrypt(base64.b64decode(sEchoStr))
+            pad = decrypted[-1]
+            if pad < 1 or pad > 32:
+                pad = 0
+            decrypted = decrypted[:-pad]
+            content = decrypted[16:]
+            xml_len = struct.unpack(">I", content[:4])[0]
+            xml_content = content[4:4 + xml_len].decode('utf-8')
+            return 0, xml_content
+        except Exception as e:
+            print("VerifyURL 解密异常:", str(e))
+            return -40002, None
+
+    def DecryptMsg(self, sPostData, sMsgSignature, sTimeStamp, sNonce):
+        try:
+            xml_tree = ET.fromstring(sPostData)
+            encrypt = xml_tree.find("Encrypt").text
+
+            sha1 = hashlib.sha1()
+            sortlist = [self.token, sTimeStamp, sNonce, encrypt]
+            sortlist.sort()
+            sha1.update("".join(sortlist).encode('utf-8'))
+            signature = sha1.hexdigest()
+
+            if signature != sMsgSignature:
+                return -40001, None
+
+            cipher = AES.new(self.key, AES.MODE_CBC, self.key[:16])
+            decrypted = cipher.decrypt(base64.b64decode(encrypt))
+            pad = decrypted[-1]
+            if pad < 1 or pad > 32:
+                pad = 0
+            decrypted = decrypted[:-pad]
+            content = decrypted[16:]
+            xml_len = struct.unpack(">I", content[:4])[0]
+            xml_content = content[4:4 + xml_len].decode('utf-8')
+            return 0, xml_content
+        except Exception as e:
+            print("DecryptMsg 异常:", str(e))
+            return -40002, None
+
+
+# ------------------------------------------------------------------
+# 业务逻辑：飞书 + 企微 + OpenAI
+# ------------------------------------------------------------------
 def get_feishu_tenant_access_token():
-    """获取飞书 token"""
     url = "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal"
     try:
         res = requests.post(url, json={"app_id": FEISHU_APP_ID, "app_secret": FEISHU_APP_SECRET}).json()
@@ -34,7 +103,6 @@ def get_feishu_tenant_access_token():
         return ""
 
 def add_record_to_bitable(fields):
-    """写入飞书多维表格"""
     token = get_feishu_tenant_access_token()
     if not token:
         print("写入飞书失败: 无有效 Token")
@@ -50,7 +118,6 @@ def add_record_to_bitable(fields):
         return False
 
 def get_wx_access_token():
-    """获取企业微信 access_token"""
     url = f"https://qyapi.weixin.qq.com/cgi-bin/gettoken?corpid={WX_CORP_ID}&corpsecret={WX_CORP_SECRET}"
     try:
         res = requests.get(url).json()
@@ -60,7 +127,6 @@ def get_wx_access_token():
         return ""
 
 def download_wx_media_as_base64(media_id):
-    """下载企业微信图片并转为 Base64"""
     token = get_wx_access_token()
     if not token:
         return None
@@ -74,7 +140,6 @@ def download_wx_media_as_base64(media_id):
     return None
 
 def parse_image_with_openai(image_base64):
-    """调用 OpenAI GPT-4o 识别订单"""
     prompt = """
     你是一个专业的数据提取助手。请从这张 Etsy 订单截图中提取以下信息，严格以 JSON 格式输出：
     {
@@ -95,7 +160,7 @@ def parse_image_with_openai(image_base64):
         "类型": "",
         "尺寸": ""
     }
-    如果某个字段截图中没有显示，设为空字符串 ""。只输出合法 JSON，不要加任何 MarkDown 标签或额外解释。
+    如果某个字段截图中没有显示，设为空字符串 ""。只输出合法 JSON，不要加任何 MarkDown 标签。
     """
     try:
         response = client.chat.completions.create(
@@ -130,9 +195,6 @@ def webhook():
         echostr = request.args.get('echostr', '')
         ret, sEchoStr = wxcpt.VerifyURL(msg_signature, timestamp, nonce, echostr)
         if ret == 0:
-            # sEchoStr 如果是 bytes 格式，转为 str
-            if isinstance(sEchoStr, bytes):
-                sEchoStr = sEchoStr.decode('utf-8')
             resp = make_response(sEchoStr, 200)
             resp.headers['Content-Type'] = 'text/plain; charset=utf-8'
             return resp
@@ -151,7 +213,6 @@ def webhook():
             xml_tree = ET.fromstring(xml_content)
             msg_type = xml_tree.find('MsgType').text
             
-            # 如果接收到的是图片消息
             if msg_type == 'image':
                 media_id = xml_tree.find('MediaId').text
                 print(f"收到图片消息，MediaId: {media_id}")
