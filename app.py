@@ -2,230 +2,211 @@ import os
 import json
 import base64
 import requests
+import threading
+import traceback
+from flask import Flask, request, jsonify
 import xml.etree.ElementTree as ET
-import time
-import struct
-import hashlib
-from flask import Flask, request, make_response
-from openai import OpenAI
-from Crypto.Cipher import AES
+from WXBizMsgCrypt3 import WXBizMsgCrypt
 
 app = Flask(__name__)
 
-# 初始化 OpenAI 客户端
-client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+# ================= 环境变量读取 =================
+WX_TOKEN = os.environ.get("WX_TOKEN")
+WX_AES_KEY = os.environ.get("WX_AES_KEY")
+WX_CORP_ID = os.environ.get("WX_CORP_ID")
+WX_CORP_SECRET = os.environ.get("WX_CORP_SECRET")  # 用于获取 access_token 下载图片
 
-# 环境变量配置
-FEISHU_APP_ID = os.environ.get("FEISHU_APP_ID", "")
-FEISHU_APP_SECRET = os.environ.get("FEISHU_APP_SECRET", "")
-BITABLE_APP_TOKEN = os.environ.get("BITABLE_APP_TOKEN", "")
-BITABLE_TABLE_ID = os.environ.get("BITABLE_TABLE_ID", "")
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+FEISHU_APP_ID = os.environ.get("FEISHU_APP_ID")
+FEISHU_APP_SECRET = os.environ.get("FEISHU_APP_SECRET")
+FEISHU_BITABLE_APP_TOKEN = os.environ.get("FEISHU_BITABLE_APP_TOKEN")
+FEISHU_TABLE_ID = os.environ.get("FEISHU_TABLE_ID")
 
-WX_CORP_ID = os.environ.get("WX_CORP_ID", "")
-WX_TOKEN = os.environ.get("WX_TOKEN", "")
-WX_AES_KEY = os.environ.get("WX_AES_KEY", "")
-WX_CORP_SECRET = os.environ.get("WX_CORP_SECRET", "")
+# 初始化企业微信加解密类
+wxcpt = WXBizMsgCrypt(WX_TOKEN, WX_AES_KEY, WX_CORP_ID)
 
-
-# ------------------------------------------------------------------
-# 企业微信加解密核心算法 (自包含，无需依赖外部 WXBizMsgCrypt 包)
-# ------------------------------------------------------------------
-class WXBizMsgCrypt:
-    def __init__(self, sToken, sEncodingAESKey, sReceiveId):
-        self.key = base64.b64decode(sEncodingAESKey + "=")
-        self.token = sToken
-        self.receiveId = sReceiveId
-
-    def VerifyURL(self, sMsgSignature, sTimeStamp, sNonce, sEchoStr):
-        sha1 = hashlib.sha1()
-        sortlist = [self.token, sTimeStamp, sNonce, sEchoStr]
-        sortlist.sort()
-        sha1.update("".join(sortlist).encode('utf-8'))
-        signature = sha1.hexdigest()
-
-        if signature != sMsgSignature:
-            return -40001, None
-
-        try:
-            cipher = AES.new(self.key, AES.MODE_CBC, self.key[:16])
-            decrypted = cipher.decrypt(base64.b64decode(sEchoStr))
-            pad = decrypted[-1]
-            if pad < 1 or pad > 32:
-                pad = 0
-            decrypted = decrypted[:-pad]
-            content = decrypted[16:]
-            xml_len = struct.unpack(">I", content[:4])[0]
-            xml_content = content[4:4 + xml_len].decode('utf-8')
-            return 0, xml_content
-        except Exception as e:
-            print("VerifyURL 解密异常:", str(e))
-            return -40002, None
-
-    def DecryptMsg(self, sPostData, sMsgSignature, sTimeStamp, sNonce):
-        try:
-            xml_tree = ET.fromstring(sPostData)
-            encrypt = xml_tree.find("Encrypt").text
-
-            sha1 = hashlib.sha1()
-            sortlist = [self.token, sTimeStamp, sNonce, encrypt]
-            sortlist.sort()
-            sha1.update("".join(sortlist).encode('utf-8'))
-            signature = sha1.hexdigest()
-
-            if signature != sMsgSignature:
-                return -40001, None
-
-            cipher = AES.new(self.key, AES.MODE_CBC, self.key[:16])
-            decrypted = cipher.decrypt(base64.b64decode(encrypt))
-            pad = decrypted[-1]
-            if pad < 1 or pad > 32:
-                pad = 0
-            decrypted = decrypted[:-pad]
-            content = decrypted[16:]
-            xml_len = struct.unpack(">I", content[:4])[0]
-            xml_content = content[4:4 + xml_len].decode('utf-8')
-            return 0, xml_content
-        except Exception as e:
-            print("DecryptMsg 异常:", str(e))
-            return -40002, None
-
-
-# ------------------------------------------------------------------
-# 业务逻辑：飞书 + 企微 + OpenAI
-# ------------------------------------------------------------------
-def get_feishu_tenant_access_token():
-    url = "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal"
-    try:
-        res = requests.post(url, json={"app_id": FEISHU_APP_ID, "app_secret": FEISHU_APP_SECRET}).json()
-        return res.get("tenant_access_token", "")
-    except Exception as e:
-        print("获取飞书 Token 异常:", str(e))
-        return ""
-
-def add_record_to_bitable(fields):
-    token = get_feishu_tenant_access_token()
-    if not token:
-        print("写入飞书失败: 无有效 Token")
-        return False
-    url = f"https://open.feishu.cn/open-apis/bitable/v1/apps/{BITABLE_APP_TOKEN}/tables/{BITABLE_TABLE_ID}/records"
-    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json; charset=utf-8"}
-    try:
-        res = requests.post(url, headers=headers, json={"fields": fields})
-        print("写入多维表格响应:", res.json())
-        return res.status_code == 200
-    except Exception as e:
-        print("写入飞书表格异常:", str(e))
-        return False
+# ================= 辅助函数 =================
 
 def get_wx_access_token():
+    """获取企业微信 access_token（用于下载图片消息）"""
     url = f"https://qyapi.weixin.qq.com/cgi-bin/gettoken?corpid={WX_CORP_ID}&corpsecret={WX_CORP_SECRET}"
-    try:
-        res = requests.get(url).json()
-        return res.get("access_token", "")
-    except Exception as e:
-        print("获取企微 Token 异常:", str(e))
-        return ""
+    res = requests.get(url).json()
+    if res.get("errcode") == 0:
+        return res.get("access_token")
+    else:
+        print(f"❌ 获取企业微信 access_token 失败: {res}")
+        return None
 
-def download_wx_media_as_base64(media_id):
+def download_wx_media(media_id):
+    """根据 media_id 从企业微信下载图片并转为 Base64"""
     token = get_wx_access_token()
     if not token:
         return None
     url = f"https://qyapi.weixin.qq.com/cgi-bin/media/get?access_token={token}&media_id={media_id}"
-    try:
-        res = requests.get(url)
-        if res.status_code == 200:
-            return base64.b64encode(res.content).decode('utf-8')
-    except Exception as e:
-        print("下载企微图片异常:", str(e))
-    return None
+    res = requests.get(url)
+    if res.status_code == 200:
+        return base64.b64encode(res.content).decode("utf-8")
+    else:
+        print(f"❌ 下载企微图片失败，状态码: {res.status_code}")
+        return None
 
-def parse_image_with_openai(image_base64):
-    prompt = """
-    你是一个专业的数据提取助手。请从这张 Etsy 订单截图中提取以下信息，严格以 JSON 格式输出：
-    {
-        "出单日期": "YYYY-MM-DD",
-        "订单号": "",
-        "运输公司": "",
-        "物流单号": "",
-        "收件人": "",
-        "地址": "",
-        "城市": "",
-        "省份": "",
-        "邮编": "",
-        "国家": "",
-        "电话": "",
-        "邮箱": "",
-        "SKU": "",
-        "定制信息": "",
-        "类型": "",
-        "尺寸": ""
+def get_feishu_access_token():
+    """获取飞书 tenant_access_token"""
+    url = "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal"
+    payload = {
+        "app_id": FEISHU_APP_ID,
+        "app_secret": FEISHU_APP_SECRET
     }
-    如果某个字段截图中没有显示，设为空字符串 ""。只输出合法 JSON，不要加任何 MarkDown 标签。
-    """
-    try:
-        response = client.chat.completions.create(
-            model="gpt-4o",
-            messages=[{
+    res = requests.post(url, json=payload).json()
+    if res.get("code") == 0:
+        return res.get("tenant_access_token")
+    else:
+        print(f"❌ 获取飞书 access_token 失败: {res}")
+        return None
+
+def write_to_feishu_bitable(data_dict):
+    """把解析出的结构化数据写入飞书多维表格"""
+    token = get_feishu_access_token()
+    if not token:
+        return False
+    
+    url = f"https://open.feishu.cn/open-apis/bitable/v1/apps/{FEISHU_BITABLE_APP_TOKEN}/tables/{FEISHU_TABLE_ID}/records"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json; charset=utf-8"
+    }
+    payload = {
+        "fields": data_dict
+    }
+    res = requests.post(url, headers=headers, json=payload).json()
+    if res.get("code") == 0:
+        print("🎉 [成功] 已成功写入飞书多维表格！")
+        return True
+    else:
+        print(f"❌ [失败] 写入飞书表格报错: {res}")
+        return False
+
+def analyze_image_with_openai(base64_image):
+    """使用 OpenAI Vision 模型识别图片内容"""
+    url = "https://api.openai.com/v1/chat/completions"
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {OPENAI_API_KEY}"
+    }
+    
+    prompt = "请分析这张截图，提取关键信息并以严格的 JSON 格式返回。不要包含任何 markdown 标签或多余解释。"
+    
+    payload = {
+        "model": "gpt-4o",  # 使用支持视觉的 gpt-4o
+        "messages": [
+            {
                 "role": "user",
                 "content": [
                     {"type": "text", "text": prompt},
-                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_base64}"}}
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:image/jpeg;base64,{base64_image}"
+                        }
+                    }
                 ]
-            }],
-            response_format={"type": "json_object"}
-        )
-        return json.loads(response.choices[0].message.content)
-    except Exception as e:
-        print("OpenAI 识别失败:", str(e))
+            }
+        ],
+        "response_format": {"type": "json_object"},
+        "max_tokens": 1000
+    }
+    
+    res = requests.post(url, headers=headers, json=payload).json()
+    if "choices" in res:
+        content = res["choices"][0]["message"]["content"]
+        return json.loads(content)
+    else:
+        print(f"❌ 调用 OpenAI 失败: {res}")
         return None
 
-@app.route('/', methods=['GET'])
+# ================= 核心后台异步任务 =================
+
+def process_image_in_background(media_id):
+    """后台异步处理图片、调用 AI 并写入飞书（包含完整错误捕捉）"""
+    print(f"\n🚀 [后台任务开始] 正在处理图片，MediaId: {media_id}")
+    try:
+        # 1. 下载图片
+        print("1️⃣ 正在从企业微信下载图片...")
+        base64_img = download_wx_media(media_id)
+        if not base64_img:
+            print("❌ 图片下载失败，终止后续任务")
+            return
+
+        # 2. 调用 OpenAI 分析
+        print("2️⃣ 正在调用 OpenAI 进行图片分析...")
+        extracted_data = analyze_image_with_openai(base64_img)
+        if not extracted_data:
+            print("❌ OpenAI 分析未返回有效数据，终止后续任务")
+            return
+        print(f"💡 AI 解析结果: {extracted_data}")
+
+        # 3. 写入飞书表格
+        print("3️⃣ 正在写入飞书多维表格...")
+        write_to_feishu_bitable(extracted_data)
+
+    except Exception as e:
+        print(f"\n❌❌❌ [后台线程崩溃报错] 原因: {str(e)}")
+        print("👇 详细错误堆栈 Traceback:")
+        traceback.print_exc()
+        print("----------------------------------------\n")
+
+# ================= 路由入口 =================
+
+@app.route('/')
 def index():
-    return "Etsy Assistant Service is running!"
+    return "Etsy Assistant Service is Running."
 
 @app.route('/webhook', methods=['GET', 'POST'])
 def webhook():
-    wxcpt = WXBizMsgCrypt(WX_TOKEN, WX_AES_KEY, WX_CORP_ID)
-    msg_signature = request.args.get('msg_signature', '')
-    timestamp = request.args.get('timestamp', '')
-    nonce = request.args.get('nonce', '')
-
-    # 1. 企微验证 URL (GET 请求)
+    # 企微验证 URL 专用 GET 请求
     if request.method == 'GET':
+        msg_signature = request.args.get('msg_signature', '')
+        timestamp = request.args.get('timestamp', '')
+        nonce = request.args.get('nonce', '')
         echostr = request.args.get('echostr', '')
+        
         ret, sEchoStr = wxcpt.VerifyURL(msg_signature, timestamp, nonce, echostr)
         if ret == 0:
-            resp = make_response(sEchoStr, 200)
-            resp.headers['Content-Type'] = 'text/plain; charset=utf-8'
-            return resp
+            return sEchoStr
         else:
-            print(f"企微 URL 验证失败，错误代码: {ret}")
-            return f"VerifyURL Error: {ret}", 400
+            print(f"❌ 企微验证 URL 失败，错误码: {ret}")
+            return "Verify failed", 400
 
-    # 2. 接收企微推送的消息 (POST 请求)
-    if request.method == 'POST':
-        ret, xml_content = wxcpt.DecryptMsg(request.data, msg_signature, timestamp, nonce)
+    # 企微接收用户消息 POST 请求
+    elif request.method == 'POST':
+        msg_signature = request.args.get('msg_signature', '')
+        timestamp = request.args.get('timestamp', '')
+        nonce = request.args.get('nonce', '')
+        req_data = request.data
+
+        ret, xml_content = wxcpt.DecryptMsg(req_data, msg_signature, timestamp, nonce)
         if ret != 0:
-            print(f"企微消息解密失败，错误代码: {ret}")
-            return "Decrypt Error", 400
-        
-        try:
-            xml_tree = ET.fromstring(xml_content)
-            msg_type = xml_tree.find('MsgType').text
+            print(f"❌ 消息解密失败，错误码: {ret}")
+            return "Decrypt failed", 400
+
+        # 解析解密后的 XML
+        root = ET.fromstring(xml_content)
+        msg_type = root.find('MsgType').text
+
+        if msg_type == 'image':
+            media_id = root.find('MediaId').text
+            print(f"\n📸 [收到图片消息] MediaId: {media_id}")
             
-            if msg_type == 'image':
-                media_id = xml_tree.find('MediaId').text
-                print(f"收到图片消息，MediaId: {media_id}")
-                image_base64 = download_wx_media_as_base64(media_id)
-                if image_base64:
-                    order_data = parse_image_with_openai(image_base64)
-                    if order_data:
-                        add_record_to_bitable(order_data)
-        except Exception as e:
-            print("解析企微消息异常:", str(e))
+            # 开启子线程异步处理，主线程立即响应 200 避免企微 5 秒超时
+            thread = threading.Thread(target=process_image_in_background, args=(media_id,))
+            thread.start()
+            
+        elif msg_type == 'text':
+            content = root.find('Content').text
+            print(f"💬 [收到文本消息]: {content}")
         
+        # 立即回复 success / 空串告知企微服务端已接收
         return "success"
 
 if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 10000))
-    app.run(host='0.0.0.0', port=port)
+    app.run(host='0.0.0.0', port=10000)
