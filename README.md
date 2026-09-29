@@ -1,0 +1,2 @@
+# etsy-bot
+etsy assistant
